@@ -1,0 +1,35 @@
+name: Integracao continua - Banco
+
+env:
+  TERRAFORM_VERSION: 1.15.8
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  terraform:
+    name: Validar Terraform
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive infra
+
+      - name: Initialize without backend
+        run: terraform -chdir=infra init -backend=false -input=false
+
+      - name: Validate Terraform
+        run: terraform -chdir=infra validate -no-color

@@ -1,0 +1,74 @@
+name: Entrega continua AWS - Banco
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: oficina-mecanica
+  TERRAFORM_VERSION: 1.15.8
+  TF_IN_AUTOMATION: true
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: oficina-mecanica-database-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Provisionar VPC e RDS
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Validate production branch
+        run: >-
+          test "$GITHUB_REF_NAME" = "main" ||
+          { echo "::error::O deploy deve ser executado a partir da branch main."; exit 1; }
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/configure-aws-credentials
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Validate AWS session
+        run: aws sts get-caller-identity
+
+      - name: Prepare shared Terraform state
+        id: state
+        run: ./scripts/bootstrap-state.sh
+
+      - name: Terraform init
+        run: >-
+          terraform -chdir=infra init
+          -input=false
+          -backend-config="bucket=${{ steps.state.outputs.state_bucket }}"
+
+      - name: Terraform validate
+        run: terraform -chdir=infra validate -no-color
+
+      - name: Terraform plan
+        run: terraform -chdir=infra plan -input=false -no-color -out=database.tfplan
+
+      - name: Terraform apply
+        run: terraform -chdir=infra apply -input=false database.tfplan
+
+      - name: Publish deployment summary
+        run: |
+          echo "### Infraestrutura de banco implantada" >> "$GITHUB_STEP_SUMMARY"
+          echo "RDS: $(terraform -chdir=infra output -raw database_address)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Banco: $(terraform -chdir=infra output -raw database_name)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Acesso: privado pela VPC" >> "$GITHUB_STEP_SUMMARY"

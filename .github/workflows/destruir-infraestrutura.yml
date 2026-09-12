@@ -1,0 +1,108 @@
+name: Destruir infraestrutura AWS - Banco
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: oficina-mecanica
+  TERRAFORM_VERSION: 1.15.8
+  TF_IN_AUTOMATION: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Digite DESTRUIR para confirmar
+        required: true
+        type: string
+
+concurrency:
+  group: oficina-mecanica-database-deploy
+  cancel-in-progress: false
+
+jobs:
+  destroy:
+    name: Destruir RDS, rede e state compartilhado
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Validate confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: test "$CONFIRMATION" = "DESTRUIR"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: ./.github/actions/configure-aws-credentials
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Locate state bucket
+        id: state
+        run: |
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          state_bucket="${PROJECT_NAME}-terraform-state-${account_id}"
+          echo "state_bucket=${state_bucket}" >> "$GITHUB_OUTPUT"
+
+          if aws s3api head-bucket --bucket "$state_bucket" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "O bucket de state nao existe. Nada para destruir."
+          fi
+
+      - name: Verify dependent infrastructure was destroyed
+        if: steps.state.outputs.exists == 'true'
+        env:
+          STATE_BUCKET: ${{ steps.state.outputs.state_bucket }}
+        run: |
+          has_resources=false
+
+          for state_key in \
+            oficina-mecanica/auth-lambda/terraform.tfstate \
+            oficina-mecanica/application/terraform.tfstate \
+            oficina-mecanica/kubernetes-addons/terraform.tfstate \
+            oficina-mecanica/kubernetes-cluster/terraform.tfstate; do
+            state_file="$(mktemp)"
+
+            if aws s3 cp "s3://${STATE_BUCKET}/${state_key}" "$state_file" >/dev/null 2>&1; then
+              managed_resources="$(jq '[.resources[]? | select(.mode == "managed")] | length' "$state_file")"
+
+              if [[ "$managed_resources" -gt 0 ]]; then
+                echo "::error::O state ${state_key} ainda possui ${managed_resources} recursos gerenciados."
+                has_resources=true
+              fi
+            fi
+          done
+
+          test "$has_resources" = "false" || {
+            echo "::error::Destrua Lambda, aplicacao e Kubernetes antes do banco."
+            exit 1
+          }
+
+      - name: Terraform init
+        if: steps.state.outputs.exists == 'true'
+        run: >-
+          terraform -chdir=infra init
+          -input=false
+          -backend-config="bucket=${{ steps.state.outputs.state_bucket }}"
+
+      - name: Terraform destroy
+        if: steps.state.outputs.exists == 'true'
+        run: terraform -chdir=infra destroy -auto-approve -input=false
+
+      - name: Destroy shared state bucket
+        if: steps.state.outputs.exists == 'true'
+        run: ./scripts/destroy-state.sh
